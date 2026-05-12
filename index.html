@@ -38,18 +38,46 @@ header .stats{
   font-family:var(--mono);font-size:12px;color:var(--muted);direction:ltr;
 }
 header .stats strong{color:var(--ink);font-weight:600}
+.header-search{
+  flex:0 0 260px; padding:6px 10px; font-family:var(--sans); font-size:13.5px;
+  border:1px solid var(--border); background:var(--surface); color:var(--ink);
+  border-radius:3px; appearance:none;-webkit-appearance:none;
+}
+.header-search:focus{
+  outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft);
+}
 
 /* filter grid */
-.filters{
+.filter-section{margin-bottom:12px}
+.filter-section-label{
+  font-size:10.5px;font-weight:600;color:var(--ink-soft);
+  letter-spacing:.04em;margin-bottom:5px;
+}
+.filter-grid{
   display:grid;
   grid-template-columns:repeat(5, minmax(0,1fr));
-  gap:8px 12px; margin-bottom:14px;
+  gap:8px 12px;
 }
 .field{display:flex;flex-direction:column;gap:3px;min-width:0}
 .field label{
   font-size:11px;color:var(--muted);font-weight:500;
   letter-spacing:.02em;
 }
+
+/* active filters bar */
+.active-filters{
+  display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;
+}
+.active-filters:empty{display:none}
+.filter-chip{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 8px;font-size:11px;
+  background:var(--accent-soft);color:var(--accent);
+  border:1px solid var(--accent);border-radius:3px;
+  cursor:pointer;font-family:var(--sans);
+}
+.filter-chip:hover{background:var(--accent);color:#fff}
+.filter-chip .chip-x{font-weight:700;font-size:13px;margin-right:2px}
 .field select, .field input{
   width:100%; padding:7px 10px; font-family:var(--sans); font-size:13.5px;
   border:1px solid var(--border); background:var(--surface); color:var(--ink);
@@ -147,11 +175,11 @@ tbody tr:last-child td{border-bottom:none}
 
 /* responsive */
 @media (max-width:900px){
-  .filters{grid-template-columns:repeat(2, 1fr)}
+  .filter-grid{grid-template-columns:repeat(2, 1fr)}
 }
 @media (max-width:560px){
   .container{padding:12px 12px 40px}
-  .filters{grid-template-columns:1fr}
+  .filter-grid{grid-template-columns:1fr}
   .col-update,.col-dim:nth-child(n+5){display:none}
   thead th:nth-child(n+4){display:none}
   tbody td:nth-child(n+4){display:none}
@@ -165,12 +193,22 @@ tbody tr:last-child td{border-bottom:none}
 
 <header>
   <h1>קטלוג סדרות עיתיות · למ"ס</h1>
+  <input type="search" id="q" class="header-search" placeholder="חיפוש שם סדרה…">
   <span class="stats"><strong id="result-num">—</strong> / <span id="total-num">—</span> · עודכן <span id="update-stamp">—</span></span>
 </header>
 
-<div class="filters" id="filters">
-  <!-- selects injected by JS -->
+<div id="filters">
+  <div class="filter-section">
+    <div class="filter-section-label">סיווג נושאי — בחר תחום והרמות המשנה מסתננות אוטומטית</div>
+    <div class="filter-grid" id="hier-filters"></div>
+  </div>
+  <div class="filter-section">
+    <div class="filter-section-label">מאפייני הסדרה</div>
+    <div class="filter-grid" id="dim-filters"></div>
+  </div>
 </div>
+
+<div id="active-filters" class="active-filters"></div>
 
 <div class="actions">
   <span class="result-count"><strong id="result-num-2">—</strong> סדרות תואמות</span>
@@ -187,6 +225,7 @@ tbody tr:last-child td{border-bottom:none}
         <th>יחידה</th>
         <th>חישוב</th>
         <th>נתון</th>
+        <th>בסיס/הצגה</th>
         <th>עדכון</th>
         <th class="col-action-h"></th>
       </tr>
@@ -204,9 +243,10 @@ const HIER = ['L1','L2','L3','L4','leaf'];
 const DIMS = ['time','unit','calc','data','price'];
 const ALL = [...HIER, ...DIMS];
 const LABELS = {
-  L1:'תחום ראשי', L2:'תת-תחום', L3:'רמה 3', L4:'רמה 4', leaf:'פירוט',
+  L1:'תחום ראשי', L2:'תת-תחום', L3:'תת-תת-תחום', L4:'רמה מפורטת', leaf:'שם הסדרה',
   time:'תדירות', unit:'יחידת מדידה', calc:'סוג חישוב', data:'סוג נתון', price:'בסיס/הצגה',
 };
+
 
 const D = JSON.parse(document.getElementById('cbs-data').textContent);
 const rows = D.rows;
@@ -221,15 +261,19 @@ state.q = '';
 
 // ---------- build filter UI ----------
 const filtersEl = document.getElementById('filters');
-ALL.forEach(key=>{
+const hierGrid = document.getElementById('hier-filters');
+const dimGrid = document.getElementById('dim-filters');
+HIER.forEach(key=>{
   const wrap = document.createElement('div'); wrap.className = 'field';
   wrap.innerHTML = `<label>${LABELS[key]}</label><select data-key="${key}"></select>`;
-  filtersEl.appendChild(wrap);
+  hierGrid.appendChild(wrap);
 });
-// search field
-const searchWrap = document.createElement('div'); searchWrap.className = 'field';
-searchWrap.innerHTML = `<label>חיפוש טקסט</label><input type="search" id="q" placeholder="חיפוש שם…">`;
-filtersEl.appendChild(searchWrap);
+
+DIMS.forEach(key=>{
+  const wrap = document.createElement('div'); wrap.className = 'field';
+  wrap.innerHTML = `<label>${LABELS[key]}</label><select data-key="${key}"></select>`;
+  dimGrid.appendChild(wrap);
+});
 
 filtersEl.querySelectorAll('select').forEach(sel=>{
   sel.addEventListener('change', e=>{
@@ -326,8 +370,36 @@ function update(){
   document.getElementById('result-num').textContent = matching.length.toLocaleString('he-IL');
   document.getElementById('result-num-2').textContent = matching.length.toLocaleString('he-IL');
 
-  const anyActive = ALL.some(k=>state[k] !== -1) || state.q;
-  document.getElementById('btn-clear').disabled = !anyActive;
+  const activeCount = ALL.filter(k=>state[k] !== -1).length + (state.q ? 1 : 0);
+  const btnClear = document.getElementById('btn-clear');
+  btnClear.disabled = !activeCount;
+  btnClear.textContent = activeCount ? `נקה הכל (${activeCount})` : 'נקה הכל';
+
+  // active filter chips
+  const chipBar = document.getElementById('active-filters');
+  let chipHtml = '';
+  for(const k of ALL){
+    if(state[k] === -1) continue;
+    const label = LABELS[k];
+    const val = dicts[k][state[k]];
+    chipHtml += `<span class="filter-chip" data-key="${k}">${escapeHtml(label)}: ${escapeHtml(val)} <span class="chip-x">&times;</span></span>`;
+  }
+  if(state.q){
+    chipHtml += `<span class="filter-chip" data-key="q">חיפוש: ${escapeHtml(state.q)} <span class="chip-x">&times;</span></span>`;
+  }
+  chipBar.innerHTML = chipHtml;
+  chipBar.querySelectorAll('.filter-chip').forEach(chip=>{
+    chip.addEventListener('click', ()=>{
+      const key = chip.dataset.key;
+      if(key === 'q'){ state.q = ''; document.getElementById('q').value = ''; }
+      else{
+        state[key] = -1;
+        const idx = HIER.indexOf(key);
+        if(idx >= 0) for(let i = idx+1; i < HIER.length; i++) state[HIER[i]] = -1;
+      }
+      update();
+    });
+  });
 
   renderRows(matching);
 }
@@ -337,7 +409,7 @@ let renderCap = 200;
 function renderRows(matching){
   const tbody = document.getElementById('rows');
   if(matching.length === 0){
-    tbody.innerHTML = `<tr><td colspan="8"><div class="empty"><strong>אין תוצאות</strong>נסה לרכך את הסינון.</div></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty"><strong>אין תוצאות</strong>נסה לרכך את הסינון.</div></td></tr>`;
     return;
   }
   const cap = Math.min(renderCap, matching.length);
@@ -346,7 +418,7 @@ function renderRows(matching){
     html += rowHtml(matching[i]);
   }
   if(matching.length > cap){
-    html += `<tr><td colspan="8" style="padding:0"><button class="show-more" id="show-more">הצג עוד 200 (מתוך ${(matching.length-cap).toLocaleString('he-IL')} נוספות)</button></td></tr>`;
+    html += `<tr><td colspan="9" style="padding:0"><button class="show-more" id="show-more">הצג עוד 200 (מתוך ${(matching.length-cap).toLocaleString('he-IL')} נוספות)</button></td></tr>`;
   }
   tbody.innerHTML = html;
   const more = document.getElementById('show-more');
@@ -355,7 +427,7 @@ function renderRows(matching){
 
 function rowHtml(r){
   const id = r[COL.id];
-  const url = `https://apis.cbs.gov.il/series/data/list?id=${id}&format=xlsx&download=true&lang=he`;
+  const url = `https://apis.cbs.gov.il/series/data/list?id=${id}&format=xls&download=true&lang=he`;
   const leafName = dicts.leaf[r[COL.leaf]] || '';
   const pathParts = ['L1','L2','L3','L4'].map(k=>{
     const v = r[COL[k]];
@@ -374,8 +446,9 @@ function rowHtml(r){
     <td class="col-dim">${dim('unit')}</td>
     <td class="col-dim">${dim('calc')}</td>
     <td class="col-dim">${dim('data')}</td>
+    <td class="col-dim">${dim('price')}</td>
     <td class="col-update">${escapeHtml(r[COL.update] || '')}</td>
-    <td class="col-action"><a class="btn-dl" href="${url}" target="_blank" rel="noopener">הורד</a></td>
+    <td class="col-action"><a class="btn-dl" href="${url}" target="_blank" rel="noopener">XLS ↓</a></td>
   </tr>`;
 }
 
