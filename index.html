@@ -161,9 +161,10 @@ tbody tr:last-child td{border-bottom:none}
   background:var(--ok-soft); color:var(--ok);
   border:1px solid var(--ok); border-radius:3px;
   font-size:11.5px; font-weight:500; text-decoration:none;
-  white-space:nowrap;
+  white-space:nowrap; cursor:pointer; font-family:inherit;
 }
 .btn-dl:hover{background:var(--ok); color:#fff}
+.btn-dl:disabled{opacity:.6; cursor:wait}
 
 /* empty */
 .empty{
@@ -308,18 +309,114 @@ document.getElementById('btn-clear').addEventListener('click', ()=>{
   update();
 });
 
-document.getElementById('btn-dl-all').addEventListener('click', ()=>{
-  lastMatching.forEach((r, i) => {
-    const id = r[COL.id];
-    const url = `https://apis.cbs.gov.il/series/data/list?id=${id}&format=xls&download=true&lang=he`;
-    setTimeout(() => {
-      const ifr = document.createElement('iframe');
-      ifr.style.display = 'none';
-      ifr.src = url;
-      document.body.appendChild(ifr);
-      setTimeout(() => ifr.remove(), 30000);
-    }, i * 300);
+// ---------- clean Excel export (built in browser from CBS JSON) ----------
+const API = 'https://apis.cbs.gov.il/series/data/list';
+const XLSX_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+let xlsxLoading = null;
+function loadXlsx(){
+  if(window.XLSX) return Promise.resolve();
+  return xlsxLoading ||= new Promise((ok, fail)=>{
+    const s = document.createElement('script');
+    s.src = XLSX_URL; s.onload = ok;
+    s.onerror = ()=>{ xlsxLoading = null; fail(new Error('טעינת ספריית Excel נכשלה')); };
+    document.head.appendChild(s);
   });
+}
+const apiUrl = (ids, page) => `${API}?id=${ids.join(',')}&format=json&lang=he&pagesize=1000&page=${page}`;
+
+// {id: [[period, value], ...]} — follows all pages (CBS's own XLS stops at 100 obs)
+async function fetchObs(ids){
+  const out = Object.fromEntries(ids.map(id=>[id, []]));
+  for(let i = 0; i < ids.length; i += 10){
+    const chunk = ids.slice(i, i+10);
+    for(let page = 1, last = 1; page <= last; page++){
+      const res = await fetch(apiUrl(chunk, page));
+      if(!res.ok) throw new Error(`CBS החזיר שגיאה ${res.status}`);
+      const ds = (await res.json()).DataSet || {};
+      last = (ds.paging && ds.paging.last_page) || 1;
+      for(const s of ds.Series || []){
+        for(const o of s.obs || []) (out[s.id] ||= []).push([o.TimePeriod, o.Value]);
+      }
+    }
+  }
+  return out;
+}
+
+const nameOf = (r, k) => r[COL[k]] >= 0 ? dicts[k][r[COL[k]]] : '';
+const topicOf = r => ['L1','L2','L3','L4'].map(k=>nameOf(r, k)).filter(Boolean).join(' › ');
+// column title: deepest topic level + series name (names alone repeat, e.g. 30× "נכסים")
+const titleOf = r => {
+  const deep = ['L4','L3','L2','L1'].map(k=>nameOf(r, k)).find(Boolean) || '';
+  const leaf = nameOf(r, 'leaf');
+  return deep && deep !== leaf ? `${deep} — ${leaf}` : leaf || deep;
+};
+const kindOf = r => ['data','price','calc'].map(k=>nameOf(r, k)).filter(Boolean).join(', ');
+
+function buildWorkbook(series, obs){
+  // Sheet 1: periods down, one column per series (like CBS table generator)
+  const head = [
+    ['סדרה', ...series.map(titleOf)],
+    ['נושא', ...series.map(topicOf)],
+    ['יחידת מדידה', ...series.map(r=>nameOf(r, 'unit'))],
+    ['תדירות', ...series.map(r=>nameOf(r, 'time'))],
+    ['סוג נתון', ...series.map(kindOf)],
+    ['קוד סדרה', ...series.map(r=>r[COL.id])],
+    [],
+    ['תקופה'],
+  ];
+  const maps = series.map(r=>new Map(obs[r[COL.id]] || []));
+  const periods = [...new Set(maps.flatMap(m=>[...m.keys()]))].sort();
+  const body = periods.map(p=>[p, ...maps.map(m=> m.has(p) ? m.get(p) : null)]);
+  const foot = [[], [`מקור: הלשכה המרכזית לסטטיסטיקה, ${API.replace('/data/list','')} — הופק ${new Date().toISOString().slice(0,10)}`]];
+  const ws = XLSX.utils.aoa_to_sheet([...head, ...body, ...foot]);
+  ws['!cols'] = [{wch:14}, ...series.map(()=>({wch:30}))];
+
+  // Sheet 2: one row per series
+  const det = [['קוד סדרה','שם הסדרה','נושא','תדירות','יחידת מדידה','סוג נתון','בסיס/הצגה','סוג חישוב','עדכון אחרון','מספר תצפיות','קישור למקור']];
+  for(const r of series){
+    const id = r[COL.id];
+    det.push([id, nameOf(r,'leaf'), topicOf(r), nameOf(r,'time'), nameOf(r,'unit'), nameOf(r,'data'),
+      nameOf(r,'price'), nameOf(r,'calc'), r[COL.update] || '', (obs[id] || []).length,
+      `${API}?id=${id}&format=json&lang=he`]);
+  }
+  const ws2 = XLSX.utils.aoa_to_sheet(det);
+  ws2['!cols'] = [10, 40, 50, 10, 18, 16, 16, 14, 12, 10, 50].map(wch=>({wch}));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'נתונים');
+  XLSX.utils.book_append_sheet(wb, ws2, 'פרטי הסדרות');
+  wb.Workbook = {Views: [{RTL: true}]};
+  return wb;
+}
+
+async function exportSeries(series, btn){
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'מכין…';
+  try{
+    await loadXlsx();
+    const obs = await fetchObs(series.map(r=>r[COL.id]));
+    const wb = buildWorkbook(series, obs);
+    const safe = s => s.replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 60);
+    const name = series.length === 1
+      ? `הלמס ${series[0][COL.id]} ${safe(nameOf(series[0], 'leaf'))}.xlsx`
+      : `הלמס ${series.length} סדרות ${new Date().toISOString().slice(0,10)}.xlsx`;
+    XLSX.writeFile(wb, name);
+  }catch(e){
+    alert('ההורדה נכשלה: ' + e.message);
+  }finally{
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+document.getElementById('btn-dl-all').addEventListener('click', e=>{
+  exportSeries(lastMatching.slice(), e.currentTarget);
+});
+document.getElementById('rows').addEventListener('click', e=>{
+  const b = e.target.closest('.btn-dl');
+  if(!b) return;
+  const id = +b.dataset.id;
+  const r = rows.find(x=>x[COL.id] === id);
+  if(r) exportSeries([r], b);
 });
 
 // ---------- filtering ----------
@@ -461,7 +558,6 @@ function renderRows(matching){
 
 function rowHtml(r){
   const id = r[COL.id];
-  const url = `https://apis.cbs.gov.il/series/data/list?id=${id}&format=xls&download=true&lang=he`;
   const leafName = dicts.leaf[r[COL.leaf]] || '';
   const pathParts = ['L1','L2','L3','L4'].map(k=>{
     const v = r[COL[k]];
@@ -482,7 +578,7 @@ function rowHtml(r){
     <td class="col-dim">${dim('data')}</td>
     <td class="col-dim">${dim('price')}</td>
     <td class="col-update">${escapeHtml(r[COL.update] || '')}</td>
-    <td class="col-action"><a class="btn-dl" href="${url}" target="_blank" rel="noopener">XLS ↓</a></td>
+    <td class="col-action"><button class="btn-dl" data-id="${id}" title="הורדת קובץ Excel">Excel ↓</button></td>
   </tr>`;
 }
 
