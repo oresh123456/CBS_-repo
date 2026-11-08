@@ -324,21 +324,64 @@ function loadXlsx(){
 }
 const apiUrl = (ids, page) => `${API}?id=${ids.join(',')}&format=json&lang=he&pagesize=1000&page=${page}`;
 
-// {id: [[period, value], ...]} — follows all pages (CBS's own XLS stops at 100 obs)
-async function fetchObs(ids){
-  const out = Object.fromEntries(ids.map(id=>[id, []]));
-  for(let i = 0; i < ids.length; i += 10){
-    const chunk = ids.slice(i, i+10);
-    for(let page = 1, last = 1; page <= last; page++){
-      const res = await fetch(apiUrl(chunk, page));
-      if(!res.ok) throw new Error(`CBS החזיר שגיאה ${res.status}`);
-      const ds = (await res.json()).DataSet || {};
-      last = (ds.paging && ds.paging.last_page) || 1;
-      for(const s of ds.Series || []){
-        for(const o of s.obs || []) (out[s.id] ||= []).push([o.TimePeriod, o.Value]);
+// One series per request: in multi-id requests CBS pads some ids with empty obs that
+// fill pages while paging.total_items ignores them -> real obs silently cut off.
+const PAGE = 1000;
+const shortIds = new Map();   // id -> [got, total] when CBS kept returning fewer obs than it reports
+async function fetchOne(id){
+  let r;
+  for(let attempt = 0; attempt < 3; attempt++){
+    r = await fetchOnce(id);
+    if(r.raw >= r.total) break;   // CBS sometimes returns a short response; retry
+  }
+  if(r.raw < r.total) shortIds.set(id, [r.raw, r.total]);
+  return r.obs;
+}
+async function fetchOnce(id){
+  const obs = [];
+  let raw = 0, total = 0;
+  for(let page = 1; ; page++){
+    const res = await fetch(apiUrl([id], page));
+    if(res.status === 500){
+      const body = await res.text();
+      if(/Result no found|Series Path Data/.test(body)) break;   // CBS: no data for this id
+      throw new Error(`CBS החזיר שגיאה 500 (סדרה ${id})`);
+    }
+    if(!res.ok) throw new Error(`CBS החזיר שגיאה ${res.status} (סדרה ${id})`);
+    const ds = (await res.json()).DataSet || {};
+    let got = 0;
+    for(const s of ds.Series || []){
+      if(s.id !== id) continue;
+      for(const o of s.obs || []){
+        got++;
+        if(o.Value !== null && o.Value !== undefined && o.Value !== '') obs.push([o.TimePeriod, o.Value]);
       }
     }
+    raw += got;
+    if(page === 1) total = (ds.paging && ds.paging.total_items) || 0;
+    const last = (ds.paging && ds.paging.last_page) || 1;
+    if(got === 0 || (page >= last && got < PAGE)) break;   // don't trust last_page alone
   }
+  const seen = new Map();
+  for(const [t, v] of obs){
+    if(seen.has(t) && seen.get(t) !== v) throw new Error(`CBS החזיר שני ערכים שונים לסדרה ${id}, תקופה ${t}`);
+    seen.set(t, v);
+  }
+  return {obs: [...seen.entries()], raw, total};
+}
+
+// {id: [[period, value], ...]} — all pages (CBS's own XLS stops at 100 obs)
+async function fetchObs(ids, onProgress){
+  const out = {};
+  let next = 0, done = 0;
+  async function worker(){
+    while(next < ids.length){
+      const id = ids[next++];
+      out[id] = await fetchOne(id);
+      if(onProgress) onProgress(++done, ids.length);
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(5, ids.length)}, worker));
   return out;
 }
 
@@ -355,7 +398,7 @@ const kindOf = r => ['data','price','calc'].map(k=>nameOf(r, k)).filter(Boolean)
 function buildWorkbook(series, obs){
   // Sheet 1: periods down, one column per series (like CBS table generator)
   const head = [
-    ['סדרה', ...series.map(titleOf)],
+    ['סדרה', ...series.map(r=> titleOf(r) + ((obs[r[COL.id]] || []).length ? '' : ' (אין נתונים ב-CBS)'))],
     ['נושא', ...series.map(topicOf)],
     ['יחידת מדידה', ...series.map(r=>nameOf(r, 'unit'))],
     ['תדירות', ...series.map(r=>nameOf(r, 'time'))],
@@ -372,15 +415,19 @@ function buildWorkbook(series, obs){
   ws['!cols'] = [{wch:14}, ...series.map(()=>({wch:30}))];
 
   // Sheet 2: one row per series
-  const det = [['קוד סדרה','שם הסדרה','נושא','תדירות','יחידת מדידה','סוג נתון','בסיס/הצגה','סוג חישוב','עדכון אחרון','מספר תצפיות','קישור למקור']];
+  const det = [['קוד סדרה','שם הסדרה','נושא','תדירות','יחידת מדידה','סוג נתון','בסיס/הצגה','סוג חישוב','עדכון אחרון','מספר תצפיות','הערה','קישור למקור']];
   for(const r of series){
     const id = r[COL.id];
+    const n = (obs[id] || []).length;
+    const sh = shortIds.get(id);
+    const note = !n ? 'אין נתונים ב-CBS לסדרה זו'
+      : sh ? `אזהרה: CBS החזיר ${sh[0]} מתוך ${sh[1]} תצפיות — ייתכן שחסרים נתונים, נסו להוריד שוב` : '';
     det.push([id, nameOf(r,'leaf'), topicOf(r), nameOf(r,'time'), nameOf(r,'unit'), nameOf(r,'data'),
-      nameOf(r,'price'), nameOf(r,'calc'), r[COL.update] || '', (obs[id] || []).length,
+      nameOf(r,'price'), nameOf(r,'calc'), r[COL.update] || '', n, note,
       `${API}?id=${id}&format=json&lang=he`]);
   }
   const ws2 = XLSX.utils.aoa_to_sheet(det);
-  ws2['!cols'] = [10, 40, 50, 10, 18, 16, 16, 14, 12, 10, 50].map(wch=>({wch}));
+  ws2['!cols'] = [10, 40, 50, 10, 18, 16, 16, 14, 12, 10, 22, 50].map(wch=>({wch}));
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'נתונים');
@@ -394,13 +441,20 @@ async function exportSeries(series, btn){
   btn.disabled = true; btn.textContent = 'מכין…';
   try{
     await loadXlsx();
-    const obs = await fetchObs(series.map(r=>r[COL.id]));
+    shortIds.clear();
+    const obs = await fetchObs(series.map(r=>r[COL.id]),
+      (d, n)=>{ if(n > 1) btn.textContent = `מכין… ${d}/${n}`; });
+    if(!series.some(r=>(obs[r[COL.id]] || []).length)){
+      alert(series.length === 1 ? 'אין נתונים ב-CBS לסדרה זו.' : 'אין נתונים ב-CBS לסדרות אלו.');
+      return;
+    }
     const wb = buildWorkbook(series, obs);
     const safe = s => s.replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 60);
     const name = series.length === 1
       ? `הלמס ${series[0][COL.id]} ${safe(nameOf(series[0], 'leaf'))}.xlsx`
       : `הלמס ${series.length} סדרות ${new Date().toISOString().slice(0,10)}.xlsx`;
     XLSX.writeFile(wb, name);
+    if(shortIds.size) alert(`שימו לב: עבור ${shortIds.size} סדרות CBS החזיר פחות תצפיות ממה שדיווח. פרטים בגיליון "פרטי הסדרות". מומלץ להוריד שוב.`);
   }catch(e){
     alert('ההורדה נכשלה: ' + e.message);
   }finally{
